@@ -158,79 +158,75 @@ def process_video_job(job_data):
     files_to_clean = []
     
     try:
-        # ADAPTED: Download GDrive links instead of Telegram file_id
+        # ... (download code remains the same) ...
         media_path = download_file_from_url(job_data['bg_link'], os.path.join(DOWNLOAD_PATH, f"bg_{job_id}.jpg"))
         bgm_path = download_file_from_url(job_data['bgm_link'], os.path.join(DOWNLOAD_PATH, f"bgm_{job_id}.mp3"))
         if not media_path or not bgm_path: raise ValueError("Media download failed.")
         files_to_clean.extend([media_path, bgm_path])
 
-        # ADAPTED: Set variables as they would be for an image in your old script
         with Image.open(media_path) as img:
             media_w, media_h = img.width, img.height
-        final_duration = IMAGE_DURATION # Use fixed duration for image
+        final_duration = IMAGE_DURATION 
 
-        # ADAPTED: Use 'quote' key from new job data
         caption_image_path = create_caption_image(job_data['quote'], job_id)
         files_to_clean.append(caption_image_path)
 
-        # PRESERVED: Your original geometry calculations
         output_filepath = os.path.join(OUTPUT_PATH, f"output_{job_id}.mp4")
         scale_ratio = COMP_WIDTH / media_w
         scaled_media_h = int(media_h * scale_ratio)
         media_y_pos = int((COMP_HEIGHT / 2 - scaled_media_h / 2) + MEDIA_Y_OFFSET)
 
-        # --- FFmpeg Command Assembly (Following Your Original Structure) ---
+        # --- FFmpeg Command Assembly ---
         command = [
             'ffmpeg', '-y',
-            # Input 0: Background (Your original)
             '-f', 'lavfi', '-i', f'color=c={BACKGROUND_COLOR}:s={COMP_SIZE_STR}:d={final_duration}',
-            # Input 1: Media (Image, looped as per your original)
             '-loop', '1', '-t', str(final_duration), '-i', media_path,
-            # Input 2: Caption Image (looped as per your original)
             '-loop', '1', '-i', caption_image_path,
-            # ADAPTED: Add BGM as a new input
             '-i', bgm_path
         ]
         
         filter_parts = []
         
-        # PRESERVED: Your original filter for media scaling and fade
+        # --- Step 1: Compose the full video with all effects ---
         media_fade_filter = f",fade=t=in:st=0:d={MEDIA_FADE_DURATION}"
         filter_parts.append(f"[1:v]scale={COMP_WIDTH}:-1,setpts=PTS-STARTPTS{media_fade_filter}[scaled_media]")
         
-        # PRESERVED: Your original filter for the caption
         caption_fade_filter = f",fade=t=in:st=0:d={CAPTION_FADE_DURATION}"
         filter_parts.append(f"[2:v]format=rgba,trim=duration={final_duration}{caption_fade_filter}[faded_caption]")
 
-        # PRESERVED: Your original overlay logic
         filter_parts.extend([
             f"[0:v][scaled_media]overlay=(W-w)/2:{media_y_pos}[base_scene]",
+            # This next line creates the final, full-length video stream called [final_v]
             f"[base_scene][faded_caption]overlay=(W-w)/2:(H-h)/2[final_v]"
         ])
         
-        # ADAPTED: Add a filter for the new audio stream
-        audio_filter = f"[3:a]atrim=0:{final_duration}[final_a]"
-        filter_parts.append(audio_filter)
+        # --- Step 2: Take the final streams and trim them ---
+        # This is the crucial part you asked for.
+        # It takes the fully composed video '[final_v]' and audio '[3:a]'
+        # and trims 0.4s from the beginning of both.
+        trim_filter = f"[final_v]trim=start=0.4,setpts=PTS-STARTPTS[trimmed_v];[3:a]atrim=start=0.4,asetpts=PTS-STARTPTS[trimmed_a]"
+        filter_parts.append(trim_filter)
 
         filter_complex = ";".join(filter_parts)
 
-        # ADAPTED: Add the new audio stream to the map
-        map_args = ['-map', '[final_v]', '-map', '[final_a]']
+        # Map the NEW, trimmed streams to the output
+        map_args = ['-map', '[trimmed_v]', '-map', '[trimmed_a]']
         
-        # PRESERVED: Your original encoding options and trim fix
         command.extend([
             '-filter_complex', filter_complex,
             *map_args,
-            '-ss', '0.4', # Your trim fix
+            # '-ss', '0.4', # <-- REMOVE THIS. The trim filter above replaced it.
             '-c:v', 'libx264',
             '-preset', 'fast', '-tune', 'zerolatency',
             '-c:a', 'aac', '-b:a', '192k',
             '-r', str(FPS),
             '-pix_fmt', 'yuv420p',
-            '-t', str(final_duration), # Explicitly set duration
+            # Set the final duration. FFmpeg is smart enough to handle this with the trimmed streams.
+            '-t', str(final_duration),
             output_filepath
         ])
         
+        # ... (subprocess and remaining code is the same) ...
         result = subprocess.run(command, capture_output=True, text=True, timeout=300)
         if result.returncode != 0:
             logging.error(f"FFMPEG STDERR: {result.stderr}")
@@ -239,7 +235,6 @@ def process_video_job(job_data):
         logging.info(f"FFmpeg processing finished for job {job_id}.")
         files_to_clean.append(output_filepath)
 
-        # ADAPTED: Removed frame extraction and updated submit call for the new worker
         submit_result_to_worker(job_data, output_filepath)
 
     except Exception as e:
