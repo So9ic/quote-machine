@@ -209,7 +209,7 @@ def process_video_job(job_data):
         ])
         
         # ADAPTED: Add a filter for the new audio stream
-        audio_filter = f"[3:a]atrim=0:{final_duration},afade=t=out:st={final_duration-2}:d=2[final_a]"
+        audio_filter = f"[3:a]atrim=0:{final_duration}[final_a]"
         filter_parts.append(audio_filter)
 
         filter_complex = ";".join(filter_parts)
