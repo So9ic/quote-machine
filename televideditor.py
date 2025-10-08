@@ -38,13 +38,12 @@ CAPTION_LINE_SPACING = 12
 CAPTION_FONT = "Montserrat-ExtraBold"
 CAPTION_TEXT_COLOR = (0, 0, 0)
 CAPTION_BG_COLOR = (255, 255, 255)
-SILENCE_THRESHOLD_DB = "-50dB"
 
 # --- File Paths ---
 DOWNLOAD_PATH = "downloads"
 OUTPUT_PATH = "outputs"
 
-# --- Helper Functions (Unchanged) ---
+# --- Helper, Railway & Worker Functions (Unchanged) ---
 def cleanup_files(file_list):
     for file_path in file_list:
         if file_path and os.path.exists(file_path):
@@ -59,7 +58,6 @@ def create_directories():
         if not os.path.exists(path):
             os.makedirs(path)
 
-# --- Railway & Worker Functions (Unchanged) ---
 def stop_railway_deployment():
     logging.info("Attempting to stop Railway deployment...")
     api_token, service_id = os.environ.get("RAILWAY_API_TOKEN"), os.environ.get("RAILWAY_SERVICE_ID")
@@ -111,7 +109,7 @@ def submit_result_to_worker(job_data, video_path):
     except Exception as e:
         logging.error(f"Error submitting to worker: {e}")
 
-# --- Core Processing Logic (Unchanged) ---
+# --- Core Processing Logic ---
 def download_file_from_url(url, save_path):
     try:
         headers = {'User-Agent': 'Mozilla/5.0'}
@@ -125,32 +123,26 @@ def download_file_from_url(url, save_path):
         logging.error(f"Download failed for {url}: {e}")
         return None
 
-def analyze_media_properties(media_path):
+def get_video_dimensions(video_path):
+    """Gets width and height from a video file."""
     try:
-        command = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height,duration', '-of', 'json', media_path]
+        command = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'json', video_path]
         result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=30)
         video_data = json.loads(result.stdout)['streams'][0]
-        width, height, duration = int(video_data['width']), int(video_data['height']), float(video_data['duration'])
-        command_audio_check = ['ffprobe', '-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=codec_type', '-of', 'json', media_path]
-        result_audio_check = subprocess.run(command_audio_check, capture_output=True, text=True, timeout=30)
-        has_audio_stream = len(json.loads(result_audio_check.stdout).get('streams', [])) > 0
-        if not has_audio_stream:
-            logging.info(f"Media properties: {width}x{height}, {duration:.2f}s. No audio stream found.")
-            return width, height, duration, True
-        command_silence = ['ffmpeg', '-i', media_path, '-af', f'silencedetect=noise={SILENCE_THRESHOLD_DB}', '-f', 'null', '-']
-        result_silence = subprocess.run(command_silence, capture_output=True, text=True, timeout=60)
-        total_silence = 0
-        for line in result_silence.stderr.split('\n'):
-            if "silencedetect" in line and "silence_duration" in line:
-                 duration_match = re.search(r'silence_duration: (\d+\.?\d*)', line)
-                 if duration_match:
-                     total_silence += float(duration_match.group(1))
-        is_silent = total_silence >= (duration - 0.1)
-        logging.info(f"Media properties: {width}x{height}, {duration:.2f}s. Detected silence: {total_silence:.2f}s. Is effectively silent: {is_silent}")
-        return width, height, duration, is_silent
+        return int(video_data['width']), int(video_data['height'])
     except Exception as e:
-        logging.error(f"FFprobe/FFmpeg analysis failed: {e}")
-        return None, None, None, True
+        logging.error(f"FFprobe failed to get video dimensions: {e}")
+        return None, None
+
+def get_audio_duration(audio_path):
+    """Gets the duration from an audio file."""
+    try:
+        command = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', audio_path]
+        result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=30)
+        return float(result.stdout.strip())
+    except Exception as e:
+        logging.error(f"FFprobe failed to get audio duration: {e}")
+        return None
 
 def create_caption_image(text, job_id):
     padded_text = ("\n" * CAPTION_TOP_PADDING_LINES) + text
@@ -176,65 +168,89 @@ def process_video_job(job_data):
     job_id = job_data['job_id']
     logging.info(f"Starting processing for job_id: {job_id}")
     files_to_clean = []
+    
     try:
+        # 1. Download media
         media_path = download_file_from_url(job_data['bg_link'], os.path.join(DOWNLOAD_PATH, f"bg_{job_id}.mp4"))
         bgm_path = download_file_from_url(job_data['bgm_link'], os.path.join(DOWNLOAD_PATH, f"bgm_{job_id}.mp3"))
         if not media_path or not bgm_path: raise ValueError("Media or BGM download failed.")
         files_to_clean.extend([media_path, bgm_path])
-        media_w, media_h, final_duration, is_effectively_silent = analyze_media_properties(media_path)
-        if not all([media_w is not None, media_h is not None, final_duration is not None]):
-            raise ValueError("Could not get media dimensions.")
+
+        # 2. Get properties: BGM duration sets the final video length
+        media_w, media_h = get_video_dimensions(media_path)
+        final_duration = get_audio_duration(bgm_path)
+        if not all([media_w, media_h, final_duration]):
+            raise ValueError("Could not get media properties.")
+        logging.info(f"BGM duration detected: {final_duration:.2f}s. This will be the final video duration.")
+
+        # 3. Create caption image
         caption_image_path, caption_height = create_caption_image(job_data['quote'], job_id)
         files_to_clean.append(caption_image_path)
+        
+        # 4. Assemble and run FFmpeg command
         output_filepath = os.path.join(OUTPUT_PATH, f"output_{job_id}.mp4")
         scale_ratio = COMP_WIDTH / media_w
         scaled_media_h = int(media_h * scale_ratio)
         media_y_pos = (COMP_HEIGHT / 2 - scaled_media_h / 2) + MEDIA_Y_OFFSET
         caption_y_pos = media_y_pos - caption_height + 1
-        command = ['ffmpeg', '-y', '-f', 'lavfi', '-i', f'color=c={BACKGROUND_COLOR}:s={COMP_SIZE_STR}:d={final_duration}', '-i', media_path, '-i', caption_image_path]
-        filter_parts = [f"[1:v]scale={COMP_WIDTH}:-1,setpts=PTS-STARTPTS[scaled_media]", f"[0:v][scaled_media]overlay=(W-w)/2:{media_y_pos}[bg_with_media]", f"[bg_with_media][2:v]overlay=(W-w)/2:{caption_y_pos}[final_v]"]
-        if not is_effectively_silent:
-            logging.info("Source video has detectable audio. Using original audio track.")
-            filter_parts.append(f"[1:a]asetpts=PTS-STARTPTS[final_a]")
-            map_args = ['-map', '[final_v]', '-map', '[final_a]']
-        else:
-            logging.info("Source video is silent or has no audio. Applying background music.")
-            command.extend(['-i', bgm_path])
-            filter_parts.append(f"[3:a]asetpts=PTS-STARTPTS[final_a]")
-            map_args = ['-map', '[final_v]', '-map', '[final_a]']
+        
+        command = [
+            'ffmpeg', '-y',
+            '-f', 'lavfi', '-i', f'color=c={BACKGROUND_COLOR}:s={COMP_SIZE_STR}:d={final_duration}', # Base color layer
+            '-stream_loop', '-1', '-i', media_path, # Loop the video input indefinitely
+            '-i', caption_image_path, # Caption image
+            '-i', bgm_path, # BGM audio
+        ]
+        
+        filter_parts = [
+            f"[1:v]scale={COMP_WIDTH}:-1,setpts=PTS-STARTPTS[scaled_media]",
+            f"[0:v][scaled_media]overlay=(W-w)/2:{media_y_pos}[bg_with_media]",
+            f"[bg_with_media][2:v]overlay=(W-w)/2:{caption_y_pos}[final_v]",
+            f"[3:a]asetpts=PTS-STARTPTS[final_a]", # Always use audio from BGM (4th input)
+        ]
+
         filter_complex = ";".join(filter_parts)
-        command.extend(['-filter_complex', filter_complex, *map_args, '-c:v', 'libx264', '-preset', 'superfast', '-tune', 'zerolatency', '-c:a', 'aac', '-b:a', '192k', '-r', str(FPS), '-pix_fmt', 'yuv420p', '-t', str(final_duration), '-shortest', output_filepath])
+        map_args = ['-map', '[final_v]', '-map', '[final_a]']
+        
+        command.extend([
+            '-filter_complex', filter_complex, *map_args,
+            '-c:v', 'libx264', '-preset', 'superfast', '-tune', 'zerolatency',
+            '-c:a', 'aac', '-b:a', '192k',
+            '-r', str(FPS), '-pix_fmt', 'yuv420p',
+            '-t', str(final_duration), # Cut the output to the BGM's duration
+            output_filepath
+        ])
+        
         result = subprocess.run(command, capture_output=True, text=True, timeout=300)
         if result.returncode != 0:
             logging.error(f"FFMPEG STDERR: {result.stderr}")
             raise subprocess.CalledProcessError(result.returncode, command, stderr=result.stderr)
+        
         logging.info(f"FFmpeg processing finished for job {job_id}.")
         files_to_clean.append(output_filepath)
         submit_result_to_worker(job_data, output_filepath)
+
     except Exception as e:
         error_snippet = str(e)[-1000:]
         logging.error(f"Failed to process job {job_id}: {error_snippet}", exc_info=True)
+    
     finally:
         logging.info(f"Cleaning up files for job {job_id}.")
         cleanup_files(files_to_clean)
 
-# --- Main Bot Loop (MODIFIED AS REQUESTED) ---
+# --- Main Bot Loop (Simplified "One-and-Done") ---
 if __name__ == '__main__':
     logging.info("Starting Python Job Processor...")
     create_directories()
     
-    # Fetch a single job from the queue. No polling or timeout.
     job = fetch_job_from_redis()
     
     if job:
-        # If a job is found, process it.
         logging.info("Job found. Processing...")
         process_video_job(job)
     else:
-        # If no job is found, just log it.
         logging.info("No job found in queue.")
     
-    # In both cases (job processed or no job found), immediately request shutdown.
     logging.info("Task complete. Requesting shutdown.")
     stop_railway_deployment()
     logging.info("Processor has finished its work and is exiting.")
