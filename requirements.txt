@@ -1,3 +1,5 @@
 pytelegrambotapi
 pillow
 requests
+flask
+waitress
