@@ -89,7 +89,7 @@ def stop_railway_deployment():
         logging.error(f"Failed to send stop command: {e}")
 
 def fetch_job_from_redis():
-    url = f"{UPSTASH_REDIS_REST_URL}/lpop/job_queue"
+    url = f"{UPSTASH_REDIS_REST_URL}/rpop/job_queue"
     headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
     try:
         response = requests.get(url, headers=headers, timeout=10)
