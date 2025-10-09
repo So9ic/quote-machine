@@ -7,6 +7,9 @@ import logging
 import subprocess
 from PIL import Image, ImageDraw, ImageFont
 import textwrap
+import threading
+from flask import Flask
+from waitress import serve
 
 # --- Logging Configuration ---
 logging.basicConfig(
@@ -258,22 +261,38 @@ def process_video_job(job_data):
         logging.info(f"Cleaning up files for job {job_id}.")
         cleanup_files(files_to_clean)
 
-# --- Main Bot Loop (MODIFIED for "One-and-Done" Lifecycle) ---
+# --- Keep-Alive Web Server ("The Receptionist") ---
+app = Flask(__name__)
+@app.route('/')
+def keep_alive():
+    """Endpoint for the pinger to hit."""
+    return "Bot is awake.", 200
+
+def run_web_server():
+    """Runs the Flask app on the port provided by Railway."""
+    port = int(os.environ.get("PORT", 8080))
+    serve(app, host='0.0.0.0', port=port)
+
+
 if __name__ == '__main__':
+    # Step 1: Start the web server in a background thread.
+    web_thread = threading.Thread(target=run_web_server, daemon=True)
+    web_thread.start()
+    logging.info("Keep-alive web server started in background.")
+
+    # --- Your original logic starts here ---
     logging.info("Starting Python Job Processor...")
     create_directories()
 
-    # --- Step 1: Fetch a single job from the queue. No loop. ---
+    # Step 2: Fetch a single job from the queue.
     raw_job = fetch_job_from_redis()
+    job_was_processed = False # A flag to track if we did real work
 
-    # --- Step 2: Check if a job was found. ---
+    # Step 3: Check if a job was found (Your original logic is preserved).
     if raw_job:
         logging.info("Job found in queue. Attempting to decode and process...")
         try:
             job_to_process = None
-
-            # --- Resiliency Logic to handle malformed data ---
-            # This logic ensures the bot won't crash on old, bad jobs.
             if isinstance(raw_job, list):
                 if raw_job: job = raw_job[0]
                 else: raise ValueError("Job was an empty list.")
@@ -286,11 +305,10 @@ if __name__ == '__main__':
                 job_to_process = job
             else:
                 raise TypeError(f"Job could not be decoded. Unknown type: {type(job)}")
-            # --- End of Resiliency Logic ---
 
-            # If decoding was successful, process the single job.
             if job_to_process:
                 process_video_job(job_to_process)
+                job_was_processed = True # We successfully processed a job
             else:
                 logging.warning(f"Job was un-parseable after decoding. Discarding.")
 
@@ -298,9 +316,17 @@ if __name__ == '__main__':
             logging.error(f"FATAL: Could not decode or process job. Discarding. Error: {e}. Original Data: {raw_job}")
     else:
         # If fetch_job_from_redis returns None, there was no job.
-        logging.info("No job found in queue.")
+        logging.info("No job found in queue. Assuming woken by pinger.")
 
-    # --- Step 3: Immediately shut down, regardless of the outcome. ---
-    logging.info("Task complete. Requesting shutdown.")
+    # --- Step 4: Enter the 70-second grace period ---
+    if job_was_processed:
+        logging.info("Task complete. Entering 70-second grace period before shutdown.")
+    else:
+        logging.warning("Entering 70-second grace period for pinger.")
+    
+    time.sleep(70)
+
+    # --- Step 5: Immediately shut down, regardless of the outcome. ---
+    logging.info("Grace period over. Requesting shutdown.")
     stop_railway_deployment()
     logging.info("Processor has finished its work and is exiting.")
