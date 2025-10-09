@@ -5,8 +5,12 @@ import requests
 import json
 import logging
 import subprocess
+import threading
 from PIL import Image, ImageDraw, ImageFont
 import textwrap
+# --- New imports for the keep-alive web server ---
+from flask import Flask
+from waitress import serve
 
 # --- Logging Configuration ---
 logging.basicConfig(
@@ -43,7 +47,7 @@ CAPTION_BG_COLOR = (255, 255, 255)
 DOWNLOAD_PATH = "downloads"
 OUTPUT_PATH = "outputs"
 
-# --- Helper, Railway & Worker Functions (Unchanged) ---
+# --- Helper, Railway & Worker Functions ---
 def cleanup_files(file_list):
     for file_path in file_list:
         if file_path and os.path.exists(file_path):
@@ -92,7 +96,12 @@ def fetch_job_from_redis():
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
         result = response.json().get("result")
-        return json.loads(result) if result else None
+        if result:
+            logging.info("Successfully fetched a new job from Redis.")
+            return json.loads(result)
+        else:
+            logging.info("Job queue in Redis is empty.")
+            return None
     except Exception as e:
         logging.error(f"Redis fetch failed: {e}")
         return None
@@ -124,7 +133,6 @@ def download_file_from_url(url, save_path):
         return None
 
 def get_video_dimensions(video_path):
-    """Gets width and height from a video file."""
     try:
         command = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'json', video_path]
         result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=30)
@@ -134,9 +142,7 @@ def get_video_dimensions(video_path):
         logging.error(f"FFprobe failed to get video dimensions: {e}")
         return None, None
 
-# --- NEW FUNCTION TO GET VIDEO DURATION ---
 def get_video_duration(video_path):
-    """Gets the duration from a video file."""
     try:
         command = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', video_path]
         result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=30)
@@ -144,10 +150,8 @@ def get_video_duration(video_path):
     except Exception as e:
         logging.error(f"FFprobe failed to get video duration: {e}")
         return None
-# --- END OF NEW FUNCTION ---
 
 def get_audio_duration(audio_path):
-    """Gets the duration from an audio file."""
     try:
         command = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', audio_path]
         result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=30)
@@ -167,11 +171,10 @@ def create_caption_image(text, job_id):
     text_bbox = dummy_draw.multiline_textbbox((0, 0), wrapped_text, font=font, align="center", spacing=CAPTION_LINE_SPACING)
     text_height = text_bbox[3] - text_bbox[1]
     rect_height = text_height + (2 * CAPTION_V_PADDING)
-    img_height = int(rect_height)
-    img = Image.new('RGBA', (COMP_WIDTH, img_height), (0, 0, 0, 0))
+    img = Image.new('RGBA', (COMP_WIDTH, int(rect_height)), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    draw.rectangle([(0, 0), (COMP_WIDTH, img_height)], fill=CAPTION_BG_COLOR)
-    draw.multiline_text((COMP_WIDTH / 2, img_height / 2), wrapped_text, font=font, fill=CAPTION_TEXT_COLOR, anchor="mm", align="center", spacing=CAPTION_LINE_SPACING)
+    draw.rectangle([(0, 0), (COMP_WIDTH, int(rect_height))], fill=CAPTION_BG_COLOR)
+    draw.multiline_text((COMP_WIDTH / 2, int(rect_height) / 2), wrapped_text, font=font, fill=CAPTION_TEXT_COLOR, anchor="mm", align="center", spacing=CAPTION_LINE_SPACING)
     caption_image_path = os.path.join(OUTPUT_PATH, f"caption_{job_id}.png")
     img.save(caption_image_path)
     return caption_image_path, rect_height
@@ -180,127 +183,89 @@ def process_video_job(job_data):
     job_id = job_data['job_id']
     logging.info(f"Starting processing for job_id: {job_id}")
     files_to_clean = []
-    
     try:
-        # 1. Download media
         media_path = download_file_from_url(job_data['bg_link'], os.path.join(DOWNLOAD_PATH, f"bg_{job_id}.mp4"))
         bgm_path = download_file_from_url(job_data['bgm_link'], os.path.join(DOWNLOAD_PATH, f"bgm_{job_id}.mp3"))
         if not media_path or not bgm_path: raise ValueError("Media or BGM download failed.")
         files_to_clean.extend([media_path, bgm_path])
-
-        # --- MODIFIED SECTION START ---
-        # 2. Get properties: BGM duration and Video duration
         media_w, media_h = get_video_dimensions(media_path)
         video_duration = get_video_duration(media_path)
         audio_duration = get_audio_duration(bgm_path)
-
-        if not all([media_w, media_h, video_duration, audio_duration]):
-            raise ValueError("Could not get media properties (dimensions or durations).")
-
-        # Calculate final duration based on the shorter of the two media files
+        if not all([media_w, media_h, video_duration, audio_duration]): raise ValueError("Could not get media properties.")
         final_duration = min(video_duration, audio_duration)
-        logging.info(f"Video duration: {video_duration:.2f}s, Audio duration: {audio_duration:.2f}s.")
-        logging.info(f"Using shorter duration for final output: {final_duration:.2f}s.")
-        # --- MODIFIED SECTION END ---
-
-        # 3. Create caption image
+        logging.info(f"Video: {video_duration:.2f}s, Audio: {audio_duration:.2f}s. Using final duration: {final_duration:.2f}s.")
         caption_image_path, caption_height = create_caption_image(job_data['quote'], job_id)
         files_to_clean.append(caption_image_path)
-        
-        # 4. Assemble and run FFmpeg command
         output_filepath = os.path.join(OUTPUT_PATH, f"output_{job_id}.mp4")
-        scale_ratio = COMP_WIDTH / media_w
-        scaled_media_h = int(media_h * scale_ratio)
+        scaled_media_h = int(media_h * (COMP_WIDTH / media_w))
         media_y_pos = (COMP_HEIGHT / 2 - scaled_media_h / 2) + MEDIA_Y_OFFSET
         caption_y_pos = media_y_pos - caption_height + 1
-        
-        command = [
-            'ffmpeg', '-y',
-            '-f', 'lavfi', '-i', f'color=c={BACKGROUND_COLOR}:s={COMP_SIZE_STR}:d={final_duration}', # Base color layer
-            '-stream_loop', '-1', '-i', media_path, # Loop the video input indefinitely
-            '-i', caption_image_path, # Caption image
-            '-i', bgm_path, # BGM audio
-        ]
-        
+        command = ['ffmpeg', '-y', '-f', 'lavfi', '-i', f'color=c={BACKGROUND_COLOR}:s={COMP_SIZE_STR}:d={final_duration}', '-stream_loop', '-1', '-i', media_path, '-i', caption_image_path, '-i', bgm_path]
         filter_parts = [
             f"[1:v]scale={COMP_WIDTH}:-1,setpts=PTS-STARTPTS[scaled_media]",
             f"[0:v][scaled_media]overlay=(W-w)/2:{media_y_pos}[bg_with_media]",
             f"[bg_with_media][2:v]overlay=(W-w)/2:{caption_y_pos}[final_v]",
-            f"[3:a]asetpts=PTS-STARTPTS[final_a]", # Always use audio from BGM (4th input)
+            f"[3:a]asetpts=PTS-STARTPTS[final_a]",
         ]
-
         filter_complex = ";".join(filter_parts)
         map_args = ['-map', '[final_v]', '-map', '[final_a]']
-        
-        command.extend([
-            '-filter_complex', filter_complex, *map_args,
-            '-c:v', 'libx264', '-preset', 'fast', '-tune', 'zerolatency',
-            '-c:a', 'aac', '-b:a', '192k',
-            '-r', str(FPS), '-pix_fmt', 'yuv420p',
-            '-t', str(final_duration), # Cut the output to the SHORTER duration
-            output_filepath
-        ])
-        
+        command.extend(['-filter_complex', filter_complex, *map_args, '-c:v', 'libx264', '-preset', 'fast', '-tune', 'zerolatency', '-c:a', 'aac', '-b:a', '192k', '-r', str(FPS), '-pix_fmt', 'yuv420p', '-t', str(final_duration), output_filepath])
         result = subprocess.run(command, capture_output=True, text=True, timeout=300)
         if result.returncode != 0:
             logging.error(f"FFMPEG STDERR: {result.stderr}")
             raise subprocess.CalledProcessError(result.returncode, command, stderr=result.stderr)
-        
         logging.info(f"FFmpeg processing finished for job {job_id}.")
         files_to_clean.append(output_filepath)
         submit_result_to_worker(job_data, output_filepath)
-
     except Exception as e:
-        error_snippet = str(e)[-1000:]
-        logging.error(f"Failed to process job {job_id}: {error_snippet}", exc_info=True)
-    
+        logging.error(f"Failed to process job {job_id}: {str(e)[-1000:]}", exc_info=True)
     finally:
         logging.info(f"Cleaning up files for job {job_id}.")
         cleanup_files(files_to_clean)
 
-# --- Main Bot Loop (MODIFIED for "One-and-Done" Lifecycle) ---
+# --- Keep-Alive Web Server ("The Receptionist") ---
+app = Flask(__name__)
+@app.route('/')
+def keep_alive():
+    """Endpoint for the pinger to hit."""
+    return "Bot is awake.", 200
+
+def run_web_server():
+    """Runs the Flask app on the port provided by Railway."""
+    port = int(os.environ.get("PORT", 8080))
+    serve(app, host='0.0.0.0', port=port)
+
+# --- Final "Grace Period" Main Logic ---
 if __name__ == '__main__':
-    logging.info("Starting Python Job Processor...")
+    # Step 1: Start the web server in a background thread.
+    web_thread = threading.Thread(target=run_web_server, daemon=True)
+    web_thread.start()
+    logging.info("Keep-alive web server started in background.")
+
+    # Step 2: Initialize and check for a job.
+    logging.info("Checking for an initial job...")
     create_directories()
+    job_to_process = fetch_job_from_redis()
 
-    # --- Step 1: Fetch a single job from the queue. No loop. ---
-    raw_job = fetch_job_from_redis()
+    # Step 3: Decide what to do based on the check.
+    if job_to_process:
+        # --- PATH A: REAL JOB ---
+        # Note: This version of the bot only processes one job at a time.
+        logging.info("Hot Start: Job found. Starting processing.")
+        process_video_job(job_to_process)
+        
+        # When the job is done, enter the grace period before shutting down.
+        logging.info("Task complete. Entering 70-second grace period before shutdown.")
+        time.sleep(70)
+        stop_railway_deployment()
 
-    # --- Step 2: Check if a job was found. ---
-    if raw_job:
-        logging.info("Job found in queue. Attempting to decode and process...")
-        try:
-            job_to_process = None
-
-            # --- Resiliency Logic to handle malformed data ---
-            # This logic ensures the bot won't crash on old, bad jobs.
-            if isinstance(raw_job, list):
-                if raw_job: job = raw_job[0]
-                else: raise ValueError("Job was an empty list.")
-            else:
-                job = raw_job
-
-            if isinstance(job, str):
-                job_to_process = json.loads(job)
-            elif isinstance(job, dict):
-                job_to_process = job
-            else:
-                raise TypeError(f"Job could not be decoded. Unknown type: {type(job)}")
-            # --- End of Resiliency Logic ---
-
-            # If decoding was successful, process the single job.
-            if job_to_process:
-                process_video_job(job_to_process)
-            else:
-                logging.warning(f"Job was un-parseable after decoding. Discarding.")
-
-        except (json.JSONDecodeError, TypeError, IndexError, ValueError) as e:
-            logging.error(f"FATAL: Could not decode or process job. Discarding. Error: {e}. Original Data: {raw_job}")
     else:
-        # If fetch_job_from_redis returns None, there was no job.
-        logging.info("No job found in queue.")
+        # --- PATH B: NO JOB WAITING (WOKEN BY PINGER) ---
+        logging.warning("Cold Start: No initial job found. Entering 70-second grace period for pinger.")
+        time.sleep(70)
+        
+        # Now that the ping has been answered or timed out, shut down.
+        logging.info("Ping handled or timed out. Requesting shutdown.")
+        stop_railway_deployment()
 
-    # --- Step 3: Immediately shut down, regardless of the outcome. ---
-    logging.info("Task complete. Requesting shutdown.")
-    stop_railway_deployment()
     logging.info("Processor has finished its work and is exiting.")
