@@ -134,6 +134,18 @@ def get_video_dimensions(video_path):
         logging.error(f"FFprobe failed to get video dimensions: {e}")
         return None, None
 
+# --- NEW FUNCTION TO GET VIDEO DURATION ---
+def get_video_duration(video_path):
+    """Gets the duration from a video file."""
+    try:
+        command = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', video_path]
+        result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=30)
+        return float(result.stdout.strip())
+    except Exception as e:
+        logging.error(f"FFprobe failed to get video duration: {e}")
+        return None
+# --- END OF NEW FUNCTION ---
+
 def get_audio_duration(audio_path):
     """Gets the duration from an audio file."""
     try:
@@ -176,12 +188,20 @@ def process_video_job(job_data):
         if not media_path or not bgm_path: raise ValueError("Media or BGM download failed.")
         files_to_clean.extend([media_path, bgm_path])
 
-        # 2. Get properties: BGM duration sets the final video length
+        # --- MODIFIED SECTION START ---
+        # 2. Get properties: BGM duration and Video duration
         media_w, media_h = get_video_dimensions(media_path)
-        final_duration = get_audio_duration(bgm_path)
-        if not all([media_w, media_h, final_duration]):
-            raise ValueError("Could not get media properties.")
-        logging.info(f"BGM duration detected: {final_duration:.2f}s. This will be the final video duration.")
+        video_duration = get_video_duration(media_path)
+        audio_duration = get_audio_duration(bgm_path)
+
+        if not all([media_w, media_h, video_duration, audio_duration]):
+            raise ValueError("Could not get media properties (dimensions or durations).")
+
+        # Calculate final duration based on the shorter of the two media files
+        final_duration = min(video_duration, audio_duration)
+        logging.info(f"Video duration: {video_duration:.2f}s, Audio duration: {audio_duration:.2f}s.")
+        logging.info(f"Using shorter duration for final output: {final_duration:.2f}s.")
+        # --- MODIFIED SECTION END ---
 
         # 3. Create caption image
         caption_image_path, caption_height = create_caption_image(job_data['quote'], job_id)
@@ -214,10 +234,10 @@ def process_video_job(job_data):
         
         command.extend([
             '-filter_complex', filter_complex, *map_args,
-            '-c:v', 'libx264', '-preset', 'superfast', '-tune', 'zerolatency',
+            '-c:v', 'libx24', '-preset', 'superfast', '-tune', 'zerolatency',
             '-c:a', 'aac', '-b:a', '192k',
             '-r', str(FPS), '-pix_fmt', 'yuv420p',
-            '-t', str(final_duration), # Cut the output to the BGM's duration
+            '-t', str(final_duration), # Cut the output to the SHORTER duration
             output_filepath
         ])
         
