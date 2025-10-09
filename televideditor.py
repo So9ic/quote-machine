@@ -238,19 +238,49 @@ def process_video_job(job_data):
         logging.info(f"Cleaning up files for job {job_id}.")
         cleanup_files(files_to_clean)
 
-# --- Main Bot Loop (Simplified "One-and-Done") ---
+# --- Main Bot Loop (MODIFIED for "One-and-Done" Lifecycle) ---
 if __name__ == '__main__':
     logging.info("Starting Python Job Processor...")
     create_directories()
-    
-    job = fetch_job_from_redis()
-    
-    if job:
-        logging.info("Job found. Processing...")
-        process_video_job(job)
+
+    # --- Step 1: Fetch a single job from the queue. No loop. ---
+    raw_job = fetch_job_from_redis()
+
+    # --- Step 2: Check if a job was found. ---
+    if raw_job:
+        logging.info("Job found in queue. Attempting to decode and process...")
+        try:
+            job_to_process = None
+
+            # --- Resiliency Logic to handle malformed data ---
+            # This logic ensures the bot won't crash on old, bad jobs.
+            if isinstance(raw_job, list):
+                if raw_job: job = raw_job[0]
+                else: raise ValueError("Job was an empty list.")
+            else:
+                job = raw_job
+
+            if isinstance(job, str):
+                job_to_process = json.loads(job)
+            elif isinstance(job, dict):
+                job_to_process = job
+            else:
+                raise TypeError(f"Job could not be decoded. Unknown type: {type(job)}")
+            # --- End of Resiliency Logic ---
+
+            # If decoding was successful, process the single job.
+            if job_to_process:
+                process_video_job(job_to_process)
+            else:
+                logging.warning(f"Job was un-parseable after decoding. Discarding.")
+
+        except (json.JSONDecodeError, TypeError, IndexError, ValueError) as e:
+            logging.error(f"FATAL: Could not decode or process job. Discarding. Error: {e}. Original Data: {raw_job}")
     else:
+        # If fetch_job_from_redis returns None, there was no job.
         logging.info("No job found in queue.")
-    
+
+    # --- Step 3: Immediately shut down, regardless of the outcome. ---
     logging.info("Task complete. Requesting shutdown.")
     stop_railway_deployment()
     logging.info("Processor has finished its work and is exiting.")
